@@ -352,6 +352,57 @@ class DTensorPolicyWorkerV2Impl(
                 scheduler=self.scheduler,
             )
 
+        # [#2955 DIAGNOSTIC -- reference provenance; REMOVE before merge] -------------
+        # On a resume (weights_path set), the reference should equal the BASE policy
+        # (model_name), NOT the resumed checkpoint now living in self.model.
+        if (
+            init_reference_model
+            and weights_path is not None
+            and self.reference_model_state_dict is not None
+        ):
+            try:
+                from transformers import AutoModelForCausalLM as _AutoLM
+
+                _rank = torch.distributed.get_rank()
+                _base = _AutoLM.from_pretrained(
+                    config["model_name"], torch_dtype=torch.float32
+                )
+                _base_sd = {k: v.detach().float().cpu() for k, v in _base.state_dict().items()}
+                _cur_sd = {
+                    k: to_local_if_dtensor(v).detach().float().cpu()
+                    for k, v in self.model.state_dict().items()
+                }
+                _ref_sd = {
+                    k: v.detach().float().cpu()
+                    for k, v in self.reference_model_state_dict.items()
+                }
+
+                def _l2(a, b):
+                    s, n = 0.0, 0
+                    for k in a:
+                        if k in b and tuple(a[k].shape) == tuple(b[k].shape):
+                            s += float(((a[k] - b[k]) ** 2).sum())
+                            n += a[k].numel()
+                    return (s ** 0.5, n)
+
+                d_base = _l2(_ref_sd, _base_sd)
+                d_ckpt = _l2(_ref_sd, _cur_sd)
+                verdict = (
+                    "CHECKPOINT (BUG #2955)"
+                    if d_ckpt[0] < d_base[0]
+                    else "BASE policy (correct)"
+                )
+                print(f"[#2955][rank{_rank}] ||ref - base||            = {d_base[0]:.6e}  (matched {d_base[1]} params)")
+                print(f"[#2955][rank{_rank}] ||ref - resumed_ckpt||    = {d_ckpt[0]:.6e}  (matched {d_ckpt[1]} params)")
+                print(f"[#2955][rank{_rank}] VERDICT: reference policy tracks {verdict}")
+                del _base, _base_sd, _cur_sd, _ref_sd
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as _e:  # a diagnostic must never break training
+                print(f"[#2955] provenance check skipped: {_e!r}")
+        # ---------------------------------------------------------------------------
+
         # Set instance attributes from runtime config (tuple unpacking)
         (
             self.model_class,  # Already set above, but includes in tuple for completeness
